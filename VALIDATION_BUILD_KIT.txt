@@ -1,0 +1,9 @@
+Color Shadow Box Studio v1.6.2 Windows Installer Build Kit
+
+Validation completed in the preparation environment:
+- Python source compilation: passed.
+- Engine tests: 5 passed.
+- Small SVG/PNG export validation: passed.
+- SVG physical page metadata verified at 210 mm x 297 mm.
+
+The final Windows EXE and Setup.exe must be built and tested on Windows.

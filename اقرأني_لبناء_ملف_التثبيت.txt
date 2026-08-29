@@ -1,0 +1,14 @@
+حزمة إنشاء ملف تثبيت Color Shadow Box Studio v1.6.2
+
+الطريقة الأسرع:
+1- فك ضغط الحزمة بالكامل.
+2- تأكد من تثبيت Python على Windows مع تفعيل Add Python to PATH.
+3- ثبّت Inno Setup 6.
+4- شغّل BUILD_FULL_SETUP.bat.
+
+ملف التثبيت النهائي سيظهر هنا:
+installer_output\ColorShadowBoxStudio_Setup_v1.6.2.exe
+
+مهم:
+- لا يمكن إنشاء Setup.exe الخاص بـWindows بشكل صحيح إلا على جهاز Windows.
+- أجهزة المستخدمين التي تثبّت البرنامج النهائي لن تحتاج إلى Python.

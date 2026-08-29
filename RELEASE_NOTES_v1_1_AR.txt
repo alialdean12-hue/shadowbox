@@ -1,0 +1,8 @@
+Color Shadow Box Studio Rebuilt v1.1
+
+- إصلاح فتح الصور ذات الأسماء أو المسارات العربية على Windows.
+- إضافة محمل صور مزدوج: OpenCV Unicode-safe ثم Pillow fallback.
+- إضافة JPG/JPEG/JFIF/WebP/BMP/TIFF/GIF/PNM/HDR/EXR وغيرها حسب codecs المثبتة.
+- قراءة أول إطار من GIF، وتصحيح دوران EXIF، ودعم CMYK JPEG.
+- HEIC/HEIF اختياري بواسطة INSTALL_HEIC_SUPPORT.bat.
+- رسائل خطأ أوضح تبين الامتداد وسبب فشل فك الصورة.

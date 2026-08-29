@@ -1,0 +1,26 @@
+Color Shadow Box Studio — Rebuilt v1 validation
+================================================
+
+Core automated tests: 4 passed.
+Python syntax check: passed for main, UI, engine, exporter, and worker files.
+Worker-process test: passed.
+Export test: passed for SVG, transparent 300 DPI PNG, multi-page vector PDF, Final Preview, editable .colorbox, and ZIP.
+
+Real image checks performed on the two portrait images supplied during development:
+
+1) صورة_مسطحة_لرجل_مسن.png
+   - 9 physical layers
+   - repeated colors retained where needed
+   - all detected components assigned exactly once
+   - 0 floating paper islands
+   - final composite exactly equals the quantized source labels
+
+2) بورتريه_مسن_بتاج_أسود.png
+   - 8 physical layers
+   - repeated black and light colors retained where required
+   - all detected components assigned exactly once
+   - 0 floating paper islands
+   - final composite exactly equals the quantized source labels
+
+Important limitation:
+The PySide6 graphical window could not be opened inside the Linux build environment. The UI files passed Python compilation and use the same PySide6 version family already installed on the user's Windows computer.
