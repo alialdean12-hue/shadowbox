@@ -179,13 +179,23 @@ def _resize_for_page(
     return resized, (x, y, fit_w, fit_h), px_per_mm
 
 
+def _cv_lab_to_cielab(lab: np.ndarray) -> np.ndarray:
+    values = np.array(lab, dtype=np.float64, copy=True)
+    values[..., 0] *= 100.0 / 255.0
+    values[..., 1:] -= 128.0
+    return values
+
+
 def _lab_distance_ciede2000(lab_a: np.ndarray, lab_b: np.ndarray) -> np.ndarray:
     """Return CIEDE2000 perceptual distance between LAB arrays.
 
+    The inputs are OpenCV 8-bit LAB values (L 0..255, a/b offset by 128), as
+    produced by ``cv2.cvtColor`` on uint8 RGB. They are converted to true
+    CIELAB (L 0..100, a/b centred on 0) before applying the formula.
     The inputs may be shape (3,), (N, 3), or broadcast-compatible arrays.
     """
-    a = np.asarray(lab_a, dtype=np.float64)
-    b = np.asarray(lab_b, dtype=np.float64)
+    a = _cv_lab_to_cielab(lab_a)
+    b = _cv_lab_to_cielab(lab_b)
     L1, a1, b1 = np.moveaxis(a, -1, 0)
     L2, a2, b2 = np.moveaxis(b, -1, 0)
 
@@ -541,6 +551,73 @@ def _absorb_invisible_palette_clusters(labels: np.ndarray, palette: np.ndarray) 
     return out
 
 
+def _absorb_edge_fringe_colors(labels: np.ndarray, palette: np.ndarray, source_rgb: np.ndarray) -> np.ndarray:
+    """Fold anti-aliasing fringe pieces back into the two colors they blend.
+
+    Resizing creates in-between colors along every edge, and k-means can pool
+    those blends into one thin "fringe" palette color. A color is a fringe
+    candidate when it covers a small part of the image and is a thin rim (it
+    almost vanishes under a 3x3 erosion). Each of its pieces is then tested on
+    the real image colors under it: when that color lies on the line between
+    two colors the piece borders, the piece is an edge blend and its pixels go
+    to whichever of the two is nearer, so no geometry is deleted. A thin line
+    of a genuinely different color is kept because it is not such a blend.
+    """
+    out = labels.astype(np.uint8, copy=True)
+    palette = np.asarray(palette, dtype=np.uint8)
+    lab = _cv_lab_to_cielab(cv2.cvtColor(palette[None, :, :], cv2.COLOR_RGB2LAB)[0].astype(np.float64))
+    source_lab = _cv_lab_to_cielab(cv2.cvtColor(source_rgb.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float64))
+    total_pixels = int(out.size)
+    kernel = np.ones((3, 3), np.uint8)
+    for color_index in [int(v) for v in np.unique(out)]:
+        if len(np.unique(out)) <= 2:
+            break
+        mask = (out == color_index).astype(np.uint8)
+        area = int(mask.sum())
+        if area == 0 or area > total_pixels * 0.005:
+            continue
+        if int(cv2.erode(mask, kernel, iterations=1).sum()) > area * 0.15:
+            continue
+        count, component_map, _stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        distance_cache: dict[int, np.ndarray] = {}
+
+        def distance_to(index: int) -> np.ndarray:
+            if index not in distance_cache:
+                distance_cache[index] = cv2.distanceTransform((out != index).astype(np.uint8), cv2.DIST_L2, 3)
+            return distance_cache[index]
+
+        for component_index in range(1, count):
+            piece = component_map == component_index
+            ring = cv2.dilate(piece.astype(np.uint8), kernel, iterations=1).astype(bool) & ~piece
+            neighbours = out[ring]
+            values, counts = np.unique(neighbours[neighbours != color_index], return_counts=True)
+            if values.size < 2:
+                continue
+            order = [int(values[i]) for i in np.argsort(counts)[::-1][:3]]
+            c = source_lab[piece].mean(axis=0)
+            blend = None
+            for pos, first in enumerate(order):
+                for second in order[pos + 1:]:
+                    a, b = lab[first], lab[second]
+                    segment = b - a
+                    length = float(segment @ segment)
+                    if length <= 0:
+                        continue
+                    t = float((c - a) @ segment) / length
+                    if not (0.05 <= t <= 0.95):
+                        continue
+                    gap = float(np.linalg.norm(a + t * segment - c))
+                    if gap <= 12.0 and (blend is None or gap < blend[0]):
+                        blend = (gap, first, second)
+            if blend is None:
+                continue
+            _gap, first, second = blend
+            nearer_first = distance_to(first) <= distance_to(second)
+            out[piece & nearer_first] = np.uint8(first)
+            out[piece & ~nearer_first] = np.uint8(second)
+    return out
+
+
 def _kmeans_quantize(rgb: np.ndarray, color_count: int, seed: int = 41) -> tuple[np.ndarray, np.ndarray]:
     color_count = max(2, min(12, int(color_count)))
     # Edge-preserving denoise removes gradient noise but keeps facial lines.
@@ -649,7 +726,7 @@ def _components_and_adjacency(labels: np.ndarray) -> tuple[np.ndarray, list[dict
     next_id = 0
     for color_index in [int(v) for v in np.unique(labels)]:
         mask = (labels == color_index).astype(np.uint8)
-        count, local, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        count, local, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=4)
         for local_id in range(1, count):
             area = int(stats[local_id, cv2.CC_STAT_AREA])
             if area <= 0:
@@ -721,7 +798,9 @@ def build_sheet_masks(layers: list[dict], component_map: np.ndarray) -> list[np.
 
 
 def floating_islands(sheet_mask: np.ndarray) -> list[dict]:
-    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(sheet_mask.astype(np.uint8), 8)
+    # Paper pieces that meet only at a pixel corner are not physically joined,
+    # so paper connectivity is 4-way.
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(sheet_mask.astype(np.uint8), connectivity=4)
     h, w = sheet_mask.shape
     result = []
     for index in range(1, count):
@@ -732,14 +811,52 @@ def floating_islands(sheet_mask: np.ndarray) -> list[dict]:
     return result
 
 
-def validate_layers(layers: list[dict], component_map: np.ndarray) -> dict:
+# Narrowest paper bridge a blade cutter can leave intact without tearing.
+MIN_BRIDGE_MM = 0.8
+
+
+def _bridge_kernel(px_per_mm: float | None) -> np.ndarray | None:
+    if not px_per_mm:
+        return None
+    size = int(round(MIN_BRIDGE_MM * float(px_per_mm)))
+    if size < 2:
+        return None
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
+def weak_bridges(sheet_mask: np.ndarray, kernel: np.ndarray | None) -> list[dict]:
+    """Paper regions held to the frame only by bridges narrower than MIN_BRIDGE_MM.
+
+    Opening the sheet with a disc of the minimum width erases every bridge
+    thinner than that disc. A region that is attached in the sheet but floats
+    after the opening hangs on such a bridge and would tear when cut.
+    """
+    if kernel is None:
+        return []
+    opened = cv2.morphologyEx(sheet_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    return floating_islands(opened)
+
+
+def validate_layers(layers: list[dict], component_map: np.ndarray, px_per_mm: float | None = None) -> dict:
     sheets = build_sheet_masks(layers, component_map)
     per_layer = [floating_islands(sheet) for sheet in sheets]
+    kernel = _bridge_kernel(px_per_mm)
+    weak_per_layer = [weak_bridges(sheet, kernel) for sheet in sheets]
     return {
         "safe": not any(per_layer),
         "floating_island_count": sum(len(items) for items in per_layer),
         "per_layer": per_layer,
+        "min_bridge_mm": MIN_BRIDGE_MM,
+        "weak_bridge_count": sum(len(items) for items in weak_per_layer),
+        "weak_per_layer": weak_per_layer,
     }
+
+
+def project_px_per_mm(project: dict) -> float:
+    value = project.get("px_per_mm")
+    if value:
+        return float(value)
+    return float(project["working_width"]) / max(1.0, float(project["page_width_mm"]))
 
 
 def _initial_layers(components: list[dict], component_map: np.ndarray, palette: np.ndarray) -> list[dict]:
@@ -788,13 +905,85 @@ def _merge_layers(layers: list[dict], first: int, second: int, target: str, comp
     return output
 
 
-def compact_layers(layers: list[dict], component_map: np.ndarray) -> list[dict]:
+def _merge_keeps_sheets_sound(
+    masks: list[np.ndarray],
+    suffix: list[np.ndarray],
+    first: int,
+    second: int,
+    target: str,
+    kernel: np.ndarray | None,
+    weak_counts: list[int],
+) -> bool:
+    """Check only the sheets a merge changes.
+
+    Sheet i is the paper left after cutting out every layer deeper than i, so
+    moving components between layers ``first`` and ``second`` changes only
+    sheets first..second-1. Layers own disjoint components, so the new deeper
+    union for those sheets is the old one plus (deeper merge) or minus
+    (shallower merge) the moved layer's mask. A merge is accepted when those
+    sheets have no floating island and no more thin bridges than before.
+    """
+    moved = masks[first] if target == "deeper" else masks[second]
+    for index in range(first, second):
+        deeper = suffix[index + 1]
+        if target == "deeper":
+            deeper = np.maximum(deeper, moved)
+        else:
+            deeper = deeper & (1 - moved)
+        sheet = (deeper == 0).astype(np.uint8)
+        if floating_islands(sheet):
+            return False
+        if kernel is not None and len(weak_bridges(sheet, kernel)) > weak_counts[index]:
+            return False
+    return True
+
+
+def compact_layers(layers: list[dict], component_map: np.ndarray, px_per_mm: float | None = None) -> list[dict]:
     """Merge repeated-color sheets only when physical safety remains exact.
 
     This is the key rule the earlier experiments violated: repeated colors are
     allowed.  The optimizer removes a repeat only when doing so creates no
-    detached paper island anywhere in the stack.
+    detached paper island anywhere in the stack, and no new paper bridge
+    narrower than MIN_BRIDGE_MM.
     """
+    current = deepcopy(layers)
+    kernel = _bridge_kernel(px_per_mm)
+    if not validate_layers(current, component_map)["safe"]:
+        return _compact_layers_full(current, component_map)
+    while True:
+        masks = [_layer_mask(component_map, list(layer.get("component_ids", []))) for layer in current]
+        suffix = [np.zeros(component_map.shape, np.uint8) for _ in range(len(current) + 1)]
+        for index in range(len(current) - 1, -1, -1):
+            suffix[index] = np.maximum(suffix[index + 1], masks[index])
+        weak_counts = [
+            len(weak_bridges((suffix[index + 1] == 0).astype(np.uint8), kernel)) if kernel is not None else 0
+            for index in range(len(current))
+        ]
+        candidates = []
+        for first in range(len(current)):
+            for second in range(first + 1, len(current)):
+                if int(current[first]["color_index"]) != int(current[second]["color_index"]):
+                    continue
+                combined_area = int(current[first].get("area", 0)) + int(current[second].get("area", 0))
+                for target in ("deeper", "shallower"):
+                    # Prefer absorbing tiny repeat groups; deeper is safer for reveal details.
+                    score = (combined_area, 0 if target == "deeper" else 1, second - first)
+                    candidates.append((score, first, second, target))
+        # Stable sort keeps the original first-found tie-break.
+        candidates.sort(key=lambda item: item[0])
+        chosen = None
+        for _score, first, second, target in candidates:
+            if _merge_keeps_sheets_sound(masks, suffix, first, second, target, kernel, weak_counts):
+                chosen = (first, second, target)
+                break
+        if chosen is None:
+            break
+        current = _merge_layers(current, chosen[0], chosen[1], chosen[2], component_map)
+    return current
+
+
+def _compact_layers_full(layers: list[dict], component_map: np.ndarray) -> list[dict]:
+    """Whole-stack search, used only when the starting stack is not yet safe."""
     current = deepcopy(layers)
     while True:
         best = None
@@ -882,6 +1071,7 @@ def analyze_image(
         before = labels.copy()
         labels = _absorb_microscopic_components(labels, palette)
         labels = _absorb_invisible_palette_clusters(labels, palette)
+        labels = _absorb_edge_fringe_colors(labels, palette, fitted_rgb)
         if np.array_equal(labels, before):
             break
     labels, mapping = _relabel_sequential(labels)
@@ -906,12 +1096,12 @@ def analyze_image(
         # rare shape still has islands; never delete the involved components.
         pass
     _progress(progress, "Compacting only physically safe repeats", 6, 9)
-    layers = compact_layers(layers, component_map)
+    layers = compact_layers(layers, component_map, px_per_mm)
     _rename_layers(layers, palette)
 
     _progress(progress, "Building cumulative cut sheets", 7, 9)
     sheets = build_sheet_masks(layers, component_map)
-    validation = validate_layers(layers, component_map)
+    validation = validate_layers(layers, component_map, px_per_mm)
     composite = render_composite(layers, sheets, palette)
 
     _progress(progress, "Preparing previews", 8, 9)
@@ -954,7 +1144,7 @@ def rebuild_project(project: dict) -> dict:
     result["layers"] = layers
     result["sheets"] = sheets
     result["composite"] = render_composite(layers, sheets, palette)
-    result["validation"] = validate_layers(layers, component_map)
+    result["validation"] = validate_layers(layers, component_map, project_px_per_mm(result))
     return result
 
 

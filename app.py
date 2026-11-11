@@ -29,6 +29,7 @@ from core.exporter import load_project, save_project
 
 APP_NAME = "Color Shadow Box Studio"
 APP_VERSION = "1.6.2 Rebuilt — A4 SVG Page + Ultra DPI PNG"
+MAX_UNDO_STEPS = 30
 ROOT_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 PAGE_PRESETS = {
     "A4 Portrait — 210 × 297 mm": (210.0, 297.0),
@@ -452,7 +453,9 @@ class ComponentsDialog(QDialog):
         self.project = project
         self.history = self.history[: self.history_index + 1]
         self.history.append(deepcopy(project))
-        self.history_index += 1
+        # Every entry is a full project copy, so keep the history bounded.
+        del self.history[:-MAX_UNDO_STEPS]
+        self.history_index = len(self.history) - 1
         if selected_component_id is not None:
             self.selected_component_id = int(selected_component_id)
             self.layer_index = max(0, component_layer_index(project, self.selected_component_id))
@@ -710,7 +713,9 @@ class MainWindow(QMainWindow):
         self.project = project
         self.edit_history = self.edit_history[: self.edit_history_index + 1]
         self.edit_history.append(deepcopy(project))
-        self.edit_history_index += 1
+        # Every entry is a full project copy, so keep the history bounded.
+        del self.edit_history[:-MAX_UNDO_STEPS]
+        self.edit_history_index = len(self.edit_history) - 1
         self.selected_component_id = int(selected_component_id) if selected_component_id is not None else None
         self.refresh_project()
         self.autosave()
@@ -739,7 +744,14 @@ class MainWindow(QMainWindow):
         self.populate_component_list(self.selected_component_id)
         self._syncing_selection = False
         validation = self.project.get("validation", {})
-        if validation.get("safe", False):
+        weak = int(validation.get("weak_bridge_count", 0))
+        if validation.get("safe", False) and weak:
+            self.status.setText(
+                f"{len(self.project['layers'])} layers • 0 floating paper islands • "
+                f"{weak} paper bridge(s) thinner than {validation.get('min_bridge_mm', 0.8):g} mm may tear"
+            )
+            self.status.setStyleSheet("color:#ffd28a;")
+        elif validation.get("safe", False):
             self.status.setText(f"{len(self.project['layers'])} layers • physically safe • 0 floating paper islands")
             self.status.setStyleSheet("color:#b8ffd2;")
         else:

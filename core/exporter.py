@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import io
+from xml.sax.saxutils import escape
 import json
 from pathlib import Path
-import shutil
 import zipfile
 
 import cv2
@@ -12,7 +12,7 @@ from PIL import Image
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.colors import Color
 
-from core.engine import color_name
+from core.engine import _bridge_kernel, color_name, floating_islands, project_px_per_mm, weak_bridges
 
 
 def safe_name(value: str) -> str:
@@ -166,19 +166,53 @@ def _antialiased_alpha(mask: np.ndarray, width_px: int, height_px: int) -> np.nd
     """
     binary = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
     h, w = binary.shape[:2]
-    supersample = 12
-    soft = cv2.resize(binary, (w * supersample, h * supersample), interpolation=cv2.INTER_CUBIC)
-    soft = cv2.GaussianBlur(
-        soft,
-        (0, 0),
-        sigmaX=0.50 * supersample,
-        sigmaY=0.50 * supersample,
-        borderType=cv2.BORDER_REPLICATE,
+    # Blur by half a mask pixel, then scale straight to the output size. The
+    # old path went through a 12x-supersampled copy of the whole page first,
+    # which needed several GB of memory for A3 at 1200 DPI.
+    soft = cv2.GaussianBlur(binary, (0, 0), sigmaX=0.50, sigmaY=0.50, borderType=cv2.BORDER_REPLICATE)
+    alpha = cv2.resize(soft, (int(width_px), int(height_px)), interpolation=cv2.INTER_CUBIC)
+    output_per_mask = max(1.0, float(width_px) / max(1, w))
+    cv2.GaussianBlur(
+        alpha, (0, 0), sigmaX=0.32 * output_per_mask, sigmaY=0.32 * output_per_mask,
+        dst=alpha, borderType=cv2.BORDER_REPLICATE,
     )
-    alpha = cv2.resize(soft, (int(width_px), int(height_px)), interpolation=cv2.INTER_AREA)
-    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=0.32, sigmaY=0.32, borderType=cv2.BORDER_REPLICATE)
-    alpha = np.where(alpha < 2, 0, np.where(alpha > 253, 255, alpha)).astype(np.uint8)
+    alpha[alpha < 2] = 0
+    alpha[alpha > 253] = 255
     return alpha
+
+
+def _rasterize_cut_sheet(hole_contours: list[np.ndarray], width_px: int, height_px: int, scale: int = 4) -> np.ndarray:
+    """Rasterize the traced sheet (page minus holes, even-odd) at ``scale``x."""
+    sheet = np.ones((height_px * scale, width_px * scale), np.uint8)
+    for contour in hole_contours:
+        points = np.round(np.asarray(contour, dtype=np.float64) * scale).astype(np.int32)
+        x, y, w, h = cv2.boundingRect(points)
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(sheet.shape[1], x + w + 1), min(sheet.shape[0], y + h + 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        stamp = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        cv2.fillPoly(stamp, [points - np.array([x0, y0], np.int32)], 1)
+        sheet[y0:y1, x0:x1] ^= stamp
+    return sheet
+
+
+def check_traced_sheet(mask: np.ndarray, px_per_mm: float | None = None) -> dict:
+    """Check the paper the cutter will actually produce from the SVG path.
+
+    Validation runs on the pixel sheet, but the exported outline is smoothed
+    and simplified first, which can pinch or close a narrow bridge. This
+    re-checks the traced shape for floating pieces and for bridges narrower
+    than the minimum width.
+    """
+    scale = 4
+    hole_contours, width_px, height_px = _vectorize_holes(mask)
+    sheet = _rasterize_cut_sheet(hole_contours, width_px, height_px, scale)
+    kernel = _bridge_kernel(px_per_mm * scale if px_per_mm else None)
+    return {
+        "floating": len(floating_islands(sheet)),
+        "weak": len(weak_bridges(sheet, kernel)),
+    }
 
 
 def write_svg(path: Path, mask: np.ndarray, rgb, width_mm: float, height_mm: float, title: str) -> None:
@@ -191,7 +225,7 @@ def write_svg(path: Path, mask: np.ndarray, rgb, width_mm: float, height_mm: flo
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width_mm:g}mm" height="{height_mm:g}mm" '
         f'viewBox="0 0 {width_mm:g} {height_mm:g}">\n'
-        f'  <title>{title}</title>\n'
+        f'  <title>{escape(str(title))}</title>\n'
         f'  <path d="{path_data}" fill="{color}" fill-rule="evenodd"/>\n'
         '</svg>\n'
     )
@@ -202,10 +236,15 @@ def write_png(path: Path, mask: np.ndarray, rgb, width_mm: float, height_mm: flo
     width_px = max(1, int(round(float(width_mm) / 25.4 * dpi)))
     height_px = max(1, int(round(float(height_mm) / 25.4 * dpi)))
     alpha = _antialiased_alpha(mask, width_px, height_px)
-    rgba = np.empty((height_px, width_px, 4), np.uint8)
-    rgba[:, :, :3] = np.asarray(rgb, dtype=np.uint8)
-    rgba[:, :, 3] = alpha
-    Image.fromarray(rgba, "RGBA").save(path, dpi=(dpi, dpi))
+    # One color at 256 opacity levels: an indexed PNG whose palette entries
+    # all share the layer color and differ only in transparency. It displays
+    # exactly like the RGBA version at a quarter of the memory.
+    alpha = np.ascontiguousarray(alpha, dtype=np.uint8)
+    image = Image.frombuffer("P", (alpha.shape[1], alpha.shape[0]), alpha, "raw", "P", 0, 1)
+    color = [int(v) for v in np.asarray(rgb, dtype=np.uint8)[:3]]
+    image.putpalette(color * 256)
+    image.save(path, dpi=(dpi, dpi), transparency=bytes(range(256)))
+    del alpha
 
 
 def write_composite_png(path: Path, composite: np.ndarray, width_mm: float, height_mm: float, dpi: int = 1200) -> None:
@@ -325,8 +364,11 @@ def export_package(project: dict, destination: str | Path, project_name: str, so
     destination = Path(destination)
     name = safe_name(project_name)
     root = destination / f"{name}_Export"
-    if root.exists():
-        shutil.rmtree(root)
+    serial = 2
+    while root.exists():
+        # Never delete a folder that is already there; write next to it.
+        root = destination / f"{name}_Export_{serial}"
+        serial += 1
     svg_dir = root / "SVG"
     png_dir = root / "PNG"
     pdf_dir = root / "PDF"
@@ -335,6 +377,15 @@ def export_package(project: dict, destination: str | Path, project_name: str, so
     zip_dir = root / "ZIP"
     for folder in (svg_dir, png_dir, pdf_dir, preview_dir, project_dir, zip_dir):
         folder.mkdir(parents=True, exist_ok=True)
+
+    px_per_mm = project_px_per_mm(project)
+    for index, (layer, mask) in enumerate(zip(project["layers"], project["sheets"]), start=1):
+        traced = check_traced_sheet(mask, px_per_mm)
+        if traced["floating"]:
+            raise ValueError(
+                f"Layer {index:02d}: the smoothed cut outline leaves {traced['floating']} "
+                "loose paper piece(s). Move the involved part to another layer and export again."
+            )
 
     palette = np.asarray(project["palette"], dtype=np.uint8)
     total = max(1, len(project["layers"]) * 2 + 4)
